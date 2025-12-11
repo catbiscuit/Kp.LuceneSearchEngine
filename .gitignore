@@ -1,0 +1,9 @@
+*/obj
+*/bin
+/.vs
+/luceneData
+/SharedData
+*.slnLaunch.user
+/Kp.LuceneSearchEngine/Kp.LuceneSearchEngine.xml
+/WebIndexDemo/WebIndexDemo.xml
+/WebSearchDemo/WebSearchDemo.xml

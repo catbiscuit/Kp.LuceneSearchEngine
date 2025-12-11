@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="CSRedisCore" Version="3.8.807" />
+	<PackageReference Include="NLog.Web.AspNetCore" Version="6.1.0" />
+	<PackageReference Include="NSwag.AspNetCore" Version="14.6.3" />
+	<PackageReference Include="SqlSugarCore" Version="5.1.4.210" />
+	<PackageReference Include="Yitter.IdGenerator" Version="1.0.14" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Kp.Entity\Kp.Entity.csproj" />
+    <ProjectReference Include="..\Kp.LuceneSearchEngine.Entity\Kp.LuceneSearchEngine.Entity.csproj" />
+    <ProjectReference Include="..\Kp.LuceneSearchEngine\Kp.LuceneSearchEngine.csproj" />
+  </ItemGroup>
+
+</Project>

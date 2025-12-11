@@ -1,0 +1,373 @@
+﻿using JiebaNet.Segmenter;
+using Kp.LuceneSearchEngine.BaseEntity;
+using Kp.LuceneSearchEngine.Extensions;
+using Kp.LuceneSearchEngine.Interfaces;
+using Kp.LuceneSearchEngine.Util;
+using Lucene.Net.Analysis;
+using Lucene.Net.Documents;
+using Lucene.Net.Index;
+using Lucene.Net.QueryParsers.Classic;
+using Lucene.Net.Search;
+using Lucene.Net.Search.Highlight;
+using Lucene.Net.Util;
+using Microsoft.Extensions.Caching.Memory;
+using System.Diagnostics;
+using System.Linq.Expressions;
+using System.Reflection;
+using System.Text.RegularExpressions;
+using TinyPinyin;
+using Directory = Lucene.Net.Store.Directory;
+
+namespace Kp.LuceneSearchEngine
+{
+    /// <summary>
+    /// 检索查询
+    /// </summary>
+    public class LuceneIndexSearcher : ILuceneIndexSearcher
+    {
+        private readonly Directory _directory;
+        private readonly Analyzer _analyzer;
+        private readonly IMemoryCache _memoryCache;
+
+        /// <summary>
+        /// 构造函数
+        /// </summary>
+        /// <param name="directory">索引目录</param>
+        /// <param name="analyzer">索引分析器</param>
+        /// <param name="memoryCache">内存缓存</param>
+        public LuceneIndexSearcher(Directory directory, Analyzer analyzer, IMemoryCache memoryCache)
+        {
+            _directory = directory;
+            _analyzer = analyzer;
+            _memoryCache = memoryCache;
+        }
+
+        /// <summary>
+        /// 分词
+        /// </summary>
+        /// <param name="keyword"></param>
+        /// <returns></returns>
+        public List<string> CutKeywords(string keyword)
+        {
+            if (keyword.Length <= 2)
+            {
+                return new List<string>
+                {
+                    keyword
+                };
+            }
+
+            keyword = keyword.Replace("AND ", "+").Replace("NOT ", "-").Replace("OR ", " ");
+            return _memoryCache.GetOrCreate(keyword, entry =>
+            {
+                entry.AbsoluteExpiration = DateTimeOffset.Now.AddHours(1);
+                var list = new HashSet<string>
+                {
+                    keyword
+                };
+                list.AddRange(Regex.Matches(keyword, @""".+""").Cast<Match>().Select(m =>
+                {
+                    keyword = keyword.Replace(m.Value, "");
+                    return m.Value;
+                }));//必须包含的
+                list.AddRange(Regex.Matches(keyword, @"\s-.+\s?").Cast<Match>().Select(m =>
+                {
+                    keyword = keyword.Replace(m.Value, "");
+                    return m.Value.Trim();
+                }));//必须不包含的
+                list.AddRange(Regex.Matches(keyword, @"[\u4e00-\u9fa5]+").Cast<Match>().Select(m => m.Value));//中文
+                list.AddRange(Regex.Matches(keyword, @"\p{P}?[A-Z]*[a-z]*[\p{P}|\p{S}]*").Cast<Match>().Select(m => m.Value));//英文单词
+                list.AddRange(Regex.Matches(keyword, "([A-z]+)([0-9.]+)").Cast<Match>().SelectMany(m => m.Groups.Cast<Group>().Select(g => g.Value)));//英文+数字
+                list.AddRange(new JiebaSegmenter().Cut(keyword, true));//结巴分词
+                list.RemoveWhere(s => s.Length < 2);
+                list.AddRange(KeywordsManager.SynonymWords.Where(t => list.Contains(t.key) || list.Contains(t.value)).SelectMany(t => new[] { t.key, t.value }));
+                var pinyins = new HashSet<string>();
+                foreach (var s in list.Select(s => Regex.Replace(s, @"\p{P}|\p{S}", "")).Distinct())
+                {
+                    if (!pinyins.Contains(s))
+                    {
+                        pinyins.AddRange(KeywordsManager.PinyinsLookup[PinyinHelper.GetPinyin(s)]);
+                    }
+
+                    var lower = s.ToLower();
+                    if (KeywordsManager.PinyinsLookup.Contains(lower))
+                    {
+                        pinyins.AddRange(KeywordsManager.PinyinsLookup[lower]);
+                    }
+                }
+
+                return list.Union(pinyins).OrderByDescending(s => s.Length).Take(10).Select(s => s.Trim('[', ']', '{', '}', '(', ')')).ToList();
+            });
+        }
+
+        /// <summary>
+        /// 分词模糊查询
+        /// </summary>
+        /// <param name="parser">条件</param>
+        /// <param name="keywords">关键词</param>
+        /// <returns></returns>
+        private BooleanQuery GetFuzzyquery(MultiFieldQueryParser parser, string keywords)
+        {
+            var finalQuery = new BooleanQuery();
+            var terms = CutKeywords(keywords);
+            foreach (var term in terms)
+            {
+                try
+                {
+                    if (term.StartsWith("\""))
+                    {
+                        finalQuery.Add(parser.Parse(term.Trim('"')), Occur.MUST);
+                    }
+                    else if (term.StartsWith("-"))
+                    {
+                        finalQuery.Add(parser.Parse(term), Occur.MUST_NOT);
+                    }
+                    else
+                    {
+                        finalQuery.Add(parser.Parse(term.Replace("~", "") + "~"), Occur.SHOULD);
+                    }
+                }
+                catch (ParseException)
+                {
+                    finalQuery.Add(parser.Parse(Regex.Replace(term, @"\p{P}|\p{S}", "")), Occur.SHOULD);
+                }
+            }
+
+            return finalQuery;
+        }
+
+        /// <summary>
+        /// 执行搜索
+        /// </summary>
+        /// <param name="options">搜索选项</param>
+        /// <param name="safeSearch">启用安全搜索</param>
+        /// <returns></returns>
+        private ILuceneSearchResultCollection PerformSearch(SearchOptions options, bool safeSearch)
+        {
+            // 结果集
+            ILuceneSearchResultCollection results = new LuceneSearchResultCollection();
+            using var reader = DirectoryReader.Open(_directory);
+            var searcher = new IndexSearcher(reader);
+            Query query;
+
+            // 启用安全搜索
+            if (safeSearch)
+            {
+                options.Keywords = QueryParserBase.Escape(options.Keywords);
+            }
+
+            if (options.Fields.Count == 1)
+            {
+                // 单字段搜索
+                var queryParser = new QueryParser(Lucene.Net.Util.LuceneVersion.LUCENE_48, options.Fields[0], _analyzer);
+                query = queryParser.Parse(options.Keywords);
+            }
+            else
+            {
+                // 多字段搜索
+                var queryParser = new MultiFieldQueryParser(Lucene.Net.Util.LuceneVersion.LUCENE_48, options.Fields.ToArray(), _analyzer, options.Boosts);
+                query = GetFuzzyquery(queryParser, options.Keywords);
+            }
+
+            // 排序规则处理
+            var sort = new Sort(options.OrderBy.ToArray());
+            if (options.Type != null)
+            {
+                query = new BooleanQuery()
+                {
+                    {query,Occur.MUST},
+                    {new TermQuery(new Term(LuceneIndexableConst.FieldNameType,options.Type.AssemblyQualifiedName)),Occur.MUST}
+                };
+            }
+
+            var matches = searcher.Search(query, options.Filter, options.MaximumNumberOfHits, sort, true, true).ScoreDocs.Where(m => m.Score >= options.Score);
+            results.TotalHits = matches.Count();
+
+            // 分页处理
+            if (options.Skip.HasValue)
+            {
+                matches = matches.Skip(options.Skip.Value);
+            }
+            if (options.Take.HasValue)
+            {
+                matches = matches.Take(options.Take.Value);
+            }
+
+            var docs = matches.ToList();
+
+            // 创建结果集
+            foreach (var match in docs)
+            {
+                var doc = searcher.Doc(match.Doc);
+                results.Results.Add(new LuceneSearchResult()
+                {
+                    Score = match.Score,
+                    Document = doc
+                });
+            }
+
+            return results;
+        }
+
+        /// <summary>
+        /// 搜索单条记录
+        /// </summary>
+        /// <param name="options"></param>
+        /// <returns></returns>
+        public Document ScoredSearchSingle(SearchOptions options)
+        {
+            options.MaximumNumberOfHits = 1;
+            var results = ScoredSearch(options);
+            return results.TotalHits > 0 ? results.Results.First().Document : null;
+        }
+
+        /// <summary>
+        /// 按权重搜索
+        /// </summary>
+        /// <param name="options">搜索选项</param>
+        /// <returns></returns>
+        public ILuceneSearchResultCollection ScoredSearch(SearchOptions options)
+        {
+            ILuceneSearchResultCollection results;
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                results = PerformSearch(options, false);
+            }
+            catch (ParseException)
+            {
+                results = PerformSearch(options, true);
+            }
+
+            sw.Stop();
+            results.Elapsed = sw.ElapsedMilliseconds;
+            return results;
+        }
+
+        /// <summary>
+        /// 按权重搜索
+        /// </summary>
+        /// <param name="keywords">关键词</param>
+        /// <param name="fields">限定检索字段</param>
+        /// <param name="maximumNumberOfHits">最大检索量</param>
+        /// <param name="boosts">多字段搜索时，给字段的搜索加速</param>
+        /// <param name="type">文档类型</param>
+        /// <param name="sortBy">排序规则</param>
+        /// <param name="skip">跳过多少条</param>
+        /// <param name="take">取多少条</param>
+        /// <returns></returns>
+        public ILuceneSearchResultCollection ScoredSearch(string keywords, string fields, int maximumNumberOfHits, Dictionary<string, float> boosts, Type type, string sortBy, int? skip, int? take)
+        {
+            var options = new SearchOptions(keywords, fields, maximumNumberOfHits, boosts, type, sortBy, skip, take);
+            return ScoredSearch(options);
+        }
+
+        public IScoredSearchResultCollection<T> ScriptSearch<T>(SearchOptions options)
+        {
+            // 结果集
+            IScoredSearchResultCollection<T> results = new ScoredSearchResultCollection<T>();
+            var sw = Stopwatch.StartNew();
+            using var reader = DirectoryReader.Open(_directory);
+            var searcher = new IndexSearcher(reader);
+
+            var queryParser = new QueryParser(LuceneVersion.LUCENE_48, options.Fields[0], _analyzer);
+            var query = queryParser.Parse(options.Keywords);
+
+            // 排序规则处理
+            var sort = new Sort(options.OrderBy.ToArray());
+            if (options.Type != null)
+            {
+                query = new BooleanQuery()
+                {
+                    {query,Occur.MUST},
+                    {new TermQuery(new Term(LuceneIndexableConst.FieldNameType,options.Type.AssemblyQualifiedName)),Occur.MUST}
+                };
+            }
+
+            var matches = searcher.Search(query, options.Filter, options.MaximumNumberOfHits, sort, true, true).ScoreDocs.Where(m => m.Score >= options.Score);
+            results.TotalHits = matches.Count();
+
+            QueryScorer scorer = null;
+            Highlighter highlighter = null;
+
+            if (options.IsHightLight)
+            {
+                scorer = new QueryScorer(query);
+                highlighter = new Highlighter(scorer);
+            }
+
+            // 分页处理
+            if (options.Skip.HasValue)
+            {
+                matches = matches.Skip(options.Skip.Value);
+            }
+            if (options.Take.HasValue)
+            {
+                matches = matches.Take(options.Take.Value);
+            }
+
+            var docs = matches.ToList();
+
+            // 创建结果集
+            foreach (var match in docs)
+            {
+                var doc = searcher.Doc(match.Doc);
+                IScoredSearchResult<T> result = new ScoredSearchResult<T>();
+                result.Score = match.Score;
+                result.Entity = options.IsHightLight ? (T)GetConcreteFromDocument(doc, reader, match.Doc, scorer, highlighter) : (T)GetConcreteFromDocument(doc);
+                results.Results.Add(result);
+            }
+
+            sw.Stop();
+            results.Elapsed = sw.ElapsedMilliseconds;
+            return results;
+        }
+
+        /// <summary>
+        ///获取文档的具体版本
+        /// </summary>
+        /// <param name ="doc">要转换的文档</param>
+        /// <returns></returns>
+        public ILuceneIndexable GetConcreteFromDocument(Document doc)
+        {
+            var t = Type.GetType(doc.Get(LuceneIndexableConst.FieldNameType));
+            var obj = Expression.Lambda<Func<ILuceneIndexable>>(Expression.New(t.GetConstructors()[0])).Compile()();
+            foreach (var p in t.GetProperties().Where(p => p.GetCustomAttributes<LuceneIndexAttribute>().Any()))
+            {
+                p.SetValue(obj, doc.Get(p.Name, p.PropertyType));
+            }
+
+            return obj;
+        }
+
+        public ILuceneIndexable GetConcreteFromDocument(Document doc, IndexReader reader, int matchDoc, QueryScorer scorer, Highlighter highlighter)
+        {
+            var t = Type.GetType(doc.Get(LuceneIndexableConst.FieldNameType));
+            var obj = Expression.Lambda<Func<ILuceneIndexable>>(Expression.New(t.GetConstructors()[0])).Compile()();
+            foreach (var p in t.GetProperties().Where(p => p.GetCustomAttributes<LuceneIndexAttribute>().Any()))
+            {
+                var propValue = doc.Get(p.Name, p.PropertyType);
+                if (propValue == null)
+                    continue;
+
+                if (propValue is string storedField)
+                {
+                    if (string.IsNullOrWhiteSpace(storedField))
+                        continue;
+
+                    TokenStream stream = TokenSources.GetAnyTokenStream(reader, matchDoc, p.Name, doc, _analyzer);
+                    IFragmenter fragmenter = new SimpleSpanFragmenter(scorer);
+                    highlighter.TextFragmenter = fragmenter;
+                    string fragment = highlighter.GetBestFragment(stream, storedField);
+                    p.SetValue(obj, string.IsNullOrWhiteSpace(fragment) ? propValue : fragment);
+                }
+                else
+                {
+                    p.SetValue(obj, propValue);
+                }
+            }
+
+            return obj;
+        }
+    }
+}
